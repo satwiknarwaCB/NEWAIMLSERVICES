@@ -1,7 +1,6 @@
 # fastapi.py - Cognitbotz AI Legal Platform - FastAPI Backend
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status, Form
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -14,7 +13,6 @@ import tempfile
 import uuid
 import sqlite3
 import glob
-import jwt
 from dotenv import load_dotenv
 from io import BytesIO
 
@@ -82,7 +80,6 @@ app.add_middleware(
 )
 
 # Security
-security = HTTPBearer()
 
 # Hardcoded users (same as rag.py)
 USERS_DB = {
@@ -205,7 +202,7 @@ def log_interaction(username: str, chat_session_id: str, user_input: str,
             (id, username, chat_session_id, session_id, timestamp, user_input, 
              bot_response, tokens_used, is_flagged, flag_reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (log_id, username, chat_session_id, str(uuid.uuid4()), 
+        """, (log_id, username or "anonymous", chat_session_id, str(uuid.uuid4()), 
               timestamp, user_input, bot_response, tokens_used, is_flagged, flag_reason))
         
         conn.commit()
@@ -229,7 +226,7 @@ def get_user_chat_sessions(username: str):
             WHERE username = ? AND chat_session_id IS NOT NULL
             GROUP BY chat_session_id
             ORDER BY first_msg_time DESC
-        """, (username,))
+        """, (username or "anonymous",))
         
         rows = cursor.fetchall()
         conn.close()
@@ -303,7 +300,7 @@ def delete_chat_session_db(chat_session_id: str, username: str):
         cursor.execute("""
             DELETE FROM chat_logs 
             WHERE chat_session_id = ? AND username = ?
-        """, (chat_session_id, username))
+        """, (chat_session_id, username or "anonymous"))
         
         conn.commit()
         deleted = cursor.rowcount
@@ -490,38 +487,11 @@ def generate_docx_document(content: str, doc_type: str, metadata: dict) -> Bytes
 
 # ==================== JWT & AUTH ====================
 
-def create_access_token(data: dict):
-    """Create JWT access token"""
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify JWT token"""
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid authentication")
-        return username
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-def get_current_user(username: str = Depends(verify_token)):
-    """Get current authenticated user"""
-    if username not in USERS_DB:
-        raise HTTPException(status_code=401, detail="User not found")
-    return username
-
-def get_or_create_session(username: str):
-    """Get or create session for user"""
-    if username not in active_sessions:
-        active_sessions[username] = {
+def get_or_create_anonymous_session():
+    """Get or create anonymous session"""
+    anonymous_user = "anonymous"
+    if anonymous_user not in active_sessions:
+        active_sessions[anonymous_user] = {
             "session_id": str(uuid.uuid4()),
             "chat_session_id": str(uuid.uuid4()),
             "chatbot_manager": None,
@@ -530,7 +500,7 @@ def get_or_create_session(username: str):
             "total_tokens_used": 0,
             "created_at": datetime.now()
         }
-    return active_sessions[username]
+    return active_sessions[anonymous_user]
 
 # ==================== STARTUP ====================
 
@@ -549,6 +519,9 @@ async def startup_event():
         logger.info(f"✅ {message}")
     else:
         logger.warning(f"⚠️ {message}")
+    
+    # Initialize anonymous session
+    get_or_create_anonymous_session()
 
 # ==================== API ENDPOINTS ====================
 
@@ -563,35 +536,25 @@ async def root():
 
 @app.post("/api/auth/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
-    """User login"""
-    username = request.username
-    password = request.password
+    """User login - now authentication-free, returns anonymous session"""
+    # Create a simple token for compatibility
+    access_token = "anonymous_token"
     
-    if username not in USERS_DB:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    user_data = USERS_DB[username]
-    if password != user_data["password"]:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    # Create access token
-    access_token = create_access_token(data={"sub": username})
-    
-    # Initialize session
-    get_or_create_session(username)
+    # Initialize anonymous session
+    get_or_create_anonymous_session()
     
     return LoginResponse(
         access_token=access_token,
         token_type="bearer",
         user={
-            "username": username,
-            "full_name": user_data["full_name"],
-            "role": user_data["role"]
+            "username": "anonymous",
+            "full_name": "Anonymous User",
+            "role": "User"
         }
     )
 
 @app.get("/api/status", response_model=StatusResponse)
-async def get_status(username: str = Depends(get_current_user)):
+async def get_status():
     """Get embeddings status"""
     embeddings_ready = check_collection_exists()
     
@@ -602,9 +565,9 @@ async def get_status(username: str = Depends(get_current_user)):
     )
 
 @app.get("/api/session/stats", response_model=SessionStats)
-async def get_session_stats(username: str = Depends(get_current_user)):
+async def get_session_stats():
     """Get session statistics"""
-    session = get_or_create_session(username)
+    session = get_or_create_anonymous_session()
     embeddings_ready = check_collection_exists()
     
     return SessionStats(
@@ -616,9 +579,9 @@ async def get_session_stats(username: str = Depends(get_current_user)):
     )
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, username: str = Depends(get_current_user)):
+async def chat(request: ChatRequest):
     """Send chat message and get response"""
-    session = get_or_create_session(username)
+    session = get_or_create_anonymous_session()
     
     # Check limits
     if session["interaction_count"] >= MAX_INTERACTIONS_PER_SESSION:
@@ -675,9 +638,9 @@ async def chat(request: ChatRequest, username: str = Depends(get_current_user)):
         session["interaction_count"] += 1
         session["total_tokens_used"] += tokens_used
         
-        # Log interaction
+        # Log interaction with anonymous user
         log_interaction(
-            username=username,
+            username="anonymous",
             chat_session_id=chat_session_id,
             user_input=request.message,
             bot_response=response.get('answer', ''),
@@ -701,29 +664,29 @@ async def chat(request: ChatRequest, username: str = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/chat/history")
-async def get_chat_history(username: str = Depends(get_current_user)):
+async def get_chat_history():
     """Get user's chat history"""
-    sessions = get_user_chat_sessions(username)
+    sessions = get_user_chat_sessions("anonymous")
     return {"sessions": sessions}
 
 @app.get("/api/chat/{chat_session_id}")
-async def get_chat(chat_session_id: str, username: str = Depends(get_current_user)):
+async def get_chat(chat_session_id: str):
     """Get specific chat session messages"""
     messages = get_chat_messages(chat_session_id)
     return {"messages": messages, "chat_session_id": chat_session_id}
 
 @app.delete("/api/chat/{chat_session_id}")
-async def delete_chat(chat_session_id: str, username: str = Depends(get_current_user)):
+async def delete_chat(chat_session_id: str):
     """Delete a chat session"""
-    success = delete_chat_session_db(chat_session_id, username)
+    success = delete_chat_session_db(chat_session_id, "anonymous")
     if success:
         return {"message": "Chat deleted successfully"}
     raise HTTPException(status_code=404, detail="Chat not found")
 
 @app.post("/api/chat/new")
-async def new_chat(username: str = Depends(get_current_user)):
+async def new_chat():
     """Start a new chat session"""
-    session = get_or_create_session(username)
+    session = get_or_create_anonymous_session()
     new_chat_id = str(uuid.uuid4())
     session["chat_session_id"] = new_chat_id
     session["interaction_count"] = 0
@@ -732,8 +695,7 @@ async def new_chat(username: str = Depends(get_current_user)):
 
 @app.post("/api/documents/upload")
 async def upload_documents(
-    files: List[UploadFile] = File(...),
-    username: str = Depends(get_current_user)
+    files: List[UploadFile] = File(...)
 ):
     """Upload and process documents
     
@@ -795,13 +757,23 @@ async def upload_documents(
         logger.error(f"Upload error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/documents/process")
+async def documents_process_double_slash(files: List[UploadFile] = File(...)):
+    """Handle POST request for double slash documents process endpoint"""
+    return await upload_documents(files)
+
+# Add the missing /api/documents/process endpoint
+@app.post("/api/documents/process")
+async def documents_process(files: List[UploadFile] = File(...)):
+    """Process uploaded documents"""
+    return await upload_documents(files)
+
 @app.post("/api/drafting/generate", response_model=DraftingResponse)
 async def generate_document(
-    request: DraftingRequest,
-    username: str = Depends(get_current_user)
+    request: DraftingRequest
 ):
     """Generate legal document"""
-    session = get_or_create_session(username)
+    session = get_or_create_anonymous_session()
     
     try:
         # Initialize drafting manager if needed
@@ -831,7 +803,7 @@ async def generate_document(
         
         # Log interaction
         log_interaction(
-            username=username,
+            username="anonymous",
             chat_session_id=session["chat_session_id"],
             user_input=request.requirements,
             bot_response=result.get('document', '')[:1000],
@@ -855,8 +827,7 @@ async def generate_document(
 async def download_document(
     format: str,
     content: str = Form(...),
-    doc_type: str = Form(...),
-    username: str = Depends(get_current_user)
+    doc_type: str = Form(...)
 ):
     """Download generated document in specified format"""
     
@@ -910,19 +881,21 @@ async def download_document(
         raise HTTPException(status_code=400, detail="Invalid format")
 
 @app.post("/api/session/reset")
-async def reset_session(username: str = Depends(get_current_user)):
+async def reset_session():
     """Reset user session"""
-    if username in active_sessions:
-        del active_sessions[username]
+    anonymous_user = "anonymous"
+    if anonymous_user in active_sessions:
+        del active_sessions[anonymous_user]
     
-    get_or_create_session(username)
+    get_or_create_anonymous_session()
     return {"message": "Session reset successfully"}
 
 @app.post("/api/auth/logout")
-async def logout(username: str = Depends(get_current_user)):
+async def logout():
     """Logout user"""
-    if username in active_sessions:
-        del active_sessions[username]
+    anonymous_user = "anonymous"
+    if anonymous_user in active_sessions:
+        del active_sessions[anonymous_user]
     
     return {"message": "Logged out successfully"}
 
