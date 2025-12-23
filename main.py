@@ -1469,18 +1469,6 @@ else:
                         "response_type": response.get('response_type', 'rag')
                     })
                     
-                    # Log
-                    log_interaction(
-                        session_id=st.session_state['session_id'],
-                        user_input=user_input,
-                        bot_response=response.get('answer', ''),
-                        tokens_used=tokens_used,
-                        is_flagged=response.get('is_flagged', False),
-                        flag_reason=response.get('flag_reason'),
-                        username=st.session_state.get('username'),
-                        chat_session_id=st.session_state.get('chat_session_id')
-                    )
-                    
                 except Exception as e:
                     logger.error(f"Chat error: {e}")
                     st.session_state['messages'].append({
